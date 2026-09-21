@@ -112,6 +112,27 @@ class ExamTaskIn(BaseModel):
         return self
 
 
+class PaperRevision(BaseModel):
+    """单份卷的定向改卷条件：必须保留 / 必须移除的题号。"""
+
+    retain_ids: List[QuestionId] = Field(
+        default_factory=list, description="必须保留在该卷中的原题题号"
+    )
+    remove_ids: List[QuestionId] = Field(
+        default_factory=list, description="必须从该卷中移除的原题题号"
+    )
+
+
+class ReviseTaskIn(BaseModel):
+    """定向改卷请求：按卷序（从 0 起）指定各卷的保留 / 移除条件。"""
+
+    name: Optional[str] = Field(None, description="新任务名称；缺省沿用源任务名称并追加“·改卷”")
+    edits: Dict[int, PaperRevision] = Field(
+        ...,
+        description="按卷序指定的人工编辑条件，如 {'0': {'retain_ids': [1], 'remove_ids': [4]}}",
+    )
+
+
 class QuestionOut(BaseModel):
     id: QuestionId
     score: int
@@ -139,6 +160,17 @@ class PaperResult(BaseModel):
     type_counts: Dict[str, int]
     knowledge_point_counts: Dict[str, int]
     repeated_knowledge_points: int
+
+    # —— 定向改卷结果（改卷任务时返回）——
+    retained_ids: Optional[List[QuestionId]] = Field(
+        None, description="（改卷）相对源卷保留的题号"
+    )
+    added_ids: Optional[List[QuestionId]] = Field(
+        None, description="（改卷）相对源卷新加入的题号"
+    )
+    removed_ids: Optional[List[QuestionId]] = Field(
+        None, description="（改卷）相对源卷被移除的题号"
+    )
 
 
 class SharedQuestionPair(BaseModel):
@@ -170,6 +202,9 @@ class TaskResult(BaseModel):
 
     seed: Optional[int] = None
     conflict_constraints: Optional[List[ConflictConstraint]] = None
+    source_task_id: Optional[int] = Field(
+        None, description="定向改卷任务的源任务 id（仅改卷任务返回）"
+    )
     message: Optional[str] = None
     error: Optional[str] = None
 
