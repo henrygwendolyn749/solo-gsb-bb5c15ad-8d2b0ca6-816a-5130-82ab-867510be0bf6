@@ -112,6 +112,42 @@ class ExamTaskIn(BaseModel):
         return self
 
 
+class PaperEdit(BaseModel):
+    """单份卷的定向改卷条件：必须保留 / 必须移除的题号。"""
+
+    paper: int = Field(..., ge=0, description="卷序号（从 0 起，与组卷结果中的 paper 下标一致）")
+    retain_ids: List[QuestionId] = Field(
+        default_factory=list, description="新卷中必须选入的题号（强制约束）"
+    )
+    remove_ids: List[QuestionId] = Field(
+        default_factory=list, description="新卷中不得选入的题号（强制约束）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "PaperEdit":
+        retain = set(self.retain_ids)
+        remove = set(self.remove_ids)
+        overlap = retain & remove
+        if overlap:
+            raise ValueError(
+                f"第 {self.paper} 卷中以下题号同时出现在保留与移除列表中: "
+                f"{sorted(overlap, key=lambda v: str(v))}"
+            )
+        # 去重（保持首次出现顺序），重复指定同一条编辑没有附加语义
+        self.retain_ids = list(dict.fromkeys(self.retain_ids))
+        self.remove_ids = list(dict.fromkeys(self.remove_ids))
+        return self
+
+
+class ReviseTaskIn(BaseModel):
+    """定向改卷请求：在已完成且可行的源任务上按卷指定保留/移除条件。"""
+
+    name: Optional[str] = Field(None, description="新任务名称；缺省沿用源任务名称")
+    edits: List[PaperEdit] = Field(
+        ..., min_length=1, description="逐卷人工编辑条件（每份卷至多一条，卷序号不可越界）"
+    )
+
+
 class QuestionOut(BaseModel):
     id: QuestionId
     score: int
@@ -140,6 +176,11 @@ class PaperResult(BaseModel):
     knowledge_point_counts: Dict[str, int]
     repeated_knowledge_points: int
 
+    # —— 定向改卷任务：相对源卷的逐题差异（仅 revise 任务返回）——
+    retained_ids: Optional[List[QuestionId]] = None
+    added_ids: Optional[List[QuestionId]] = None
+    removed_ids: Optional[List[QuestionId]] = None
+
 
 class SharedQuestionPair(BaseModel):
     papers: List[int] = Field(..., description="两份卷的序号（从 0 起）")
@@ -160,6 +201,11 @@ class TaskResult(BaseModel):
     knowledge_point_counts: Optional[Dict[str, int]] = None
     repeated_knowledge_points: Optional[int] = None
 
+    # —— 定向改卷任务：单卷响应的逐题差异（仅 revise 任务返回）——
+    retained_ids: Optional[List[QuestionId]] = None
+    added_ids: Optional[List[QuestionId]] = None
+    removed_ids: Optional[List[QuestionId]] = None
+
     # —— 多卷响应（paper_count 为 2~5）——
     paper_count: Optional[int] = None
     max_shared_questions: Optional[int] = None
@@ -169,6 +215,9 @@ class TaskResult(BaseModel):
     shared_question_pairs: Optional[List[SharedQuestionPair]] = None
 
     seed: Optional[int] = None
+    source_task_id: Optional[int] = Field(
+        None, description="定向改卷任务的源任务 ID（仅 revise 任务返回）"
+    )
     conflict_constraints: Optional[List[ConflictConstraint]] = None
     message: Optional[str] = None
     error: Optional[str] = None
@@ -185,4 +234,7 @@ class TaskStatus(BaseModel):
     name: Optional[str] = None
     seed: int
     created_at: str
+    source_task_id: Optional[int] = Field(
+        None, description="定向改卷任务的源任务 ID（仅 revise 任务返回）"
+    )
     result: Optional[TaskResult] = None

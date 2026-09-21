@@ -4,6 +4,8 @@
 
 支持一次请求生成 **2～5 份平行卷**（`paper_count`）：所有卷在同一个 CP-SAT 联合模型中分别满足全部单卷约束，并限制任意两卷共同题数不超过 `max_shared_questions`；多卷可行解按 **各卷难度偏差总和 → 跨卷重复题总数 → 各卷题号序列** 依次择优，无解时冲突集区分**单卷约束**（`per_paper`）与**跨卷重叠上限**（`cross_paper`）。不传 `paper_count` 时为单卷，请求与响应结构完全保持兼容。
 
+此外支持对已完成且可行的任务**定向改卷**（`POST /api/tasks/{task_id}/revise`）：按卷指定必须保留/移除的题号，联合重求解全部卷并在满足原约束的前提下**最大化各卷保留原题总数**，详见下文[定向改卷](#定向改卷post-apitaskstask_idrevise)。
+
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
 
 ## 启动
@@ -25,6 +27,7 @@ docker compose up --build
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id` |
+| `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
 | `GET`  | `/api/tasks/{task_id}` | 查询任务状态与结果 |
 | `GET`  | `/health` | 健康检查 |
 
@@ -41,8 +44,8 @@ curl -X POST http://localhost:8000/api/tasks \
       {"id": 1, "score": 5,  "type": "single_choice", "difficulty": 0.2, "knowledge_points": ["集合"]},
       {"id": 2, "score": 5,  "type": "single_choice", "difficulty": 0.5, "knowledge_points": ["函数"]},
       {"id": 3, "score": 5,  "type": "single_choice", "difficulty": 0.8, "knowledge_points": ["导数"]},
-      {"id": 4, "score": 12, "type": "essay",         "difficulty": 0.6, "knowledge_points": ["函数", "导数"]},
-      {"id": 5, "score": 13, "type": "essay",         "difficulty": 0.7, "knowledge_points": ["数列"]}
+      {"id": 4, "score": 10, "type": "essay",         "difficulty": 0.6, "knowledge_points": ["函数", "导数"]},
+      {"id": 5, "score": 10, "type": "essay",         "difficulty": 0.7, "knowledge_points": ["数列"]}
     ],
     "total_score": 20,
     "type_counts": {"single_choice": 2, "essay": 1},
@@ -154,18 +157,120 @@ curl -X POST http://localhost:8000/api/tasks \
 
 上例表示：第 2 卷（`paper: 1`）的题型数量约束与卷 2/卷 3 的零重叠上限相互冲突（题库中大题不足）；放宽其中任一条（例如允许两卷共用 1 题，或调大题量）后即可组卷。
 
+## 定向改卷（`POST /api/tasks/{task_id}/revise`）
+
+在一份**已完成且可行**的组卷结果上按卷施加人工编辑：指定每份卷**必须保留**与**必须移除**的题号，服务在**联合模型中对全部卷重新求解**，得到满足编辑条件且尽量少改的新平行卷组。
+
+- 源任务仅允许状态为 `done` 且结果为 `feasible`：任务不存在返回 `404`；未完成或不可行返回 `422`。
+- 请求体逐卷给出编辑（卷序号 `paper` 从 0 起）：`retain_ids`（必须选入）、`remove_ids`（不得选入）。
+  - 两者题号重叠、引用题库中不存在的题号、卷序号越界、同一卷重复指定，均返回 `422`。
+- 创建后返回一个**新的异步任务**：源任务请求、题库快照与编辑条件一并冻结，**源任务保持不变**；新任务沿用源任务的 `seed`，也可再次作为源任务继续改卷。
+- 求解顺序在原有三层择优之前新增第 0 层：
+
+  1. **各卷保留源卷原题的总数最大化**（先满足全部原始约束与人工编辑，再尽量少改）；
+  2. 各卷难度偏差总和（单卷为自身偏差）最小；
+  3. 跨卷重复题总数（单卷为重复知识点数）最少；
+  4. 各卷题号序列最小。
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/42/revise \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "A/B 平行卷·人工微调",
+    "edits": [
+      {"paper": 0, "retain_ids": [9],            "remove_ids": [12, 13]},
+      {"paper": 1, "retain_ids": [4, 7],         "remove_ids": []}
+    ]
+  }'
+# -> {"task_id": 43, "status": "pending"}
+```
+
+字段说明：
+
+- `name`：新任务名称，缺省沿用源任务名称。
+- `edits`：非空数组，每份卷至多一条；未出现的卷序表示该卷无人工编辑条件（仍参与联合重求解与保留最大化）。
+
+新任务通过 `GET /api/tasks/43` 查询，顶层与 `result` 均带 `source_task_id`（上例为 `42`）；可行时逐卷给出与源卷的差异：
+
+- `retained_ids`：新卷选入、且源卷也有的题号（保留的原题）；
+- `added_ids`：源卷没有、新卷新增的题号；
+- `removed_ids`：源卷有、新卷被移走的题号（按题库规范顺序输出）。
+
+多卷时差异位于 `papers[i]` 内：
+
+```json
+{
+  "status": "feasible",
+  "source_task_id": 42,
+  "paper_count": 2,
+  "papers": [
+    {
+      "selected_ids": [1, 4, 8, 9, "/* … */"],
+      "retained_ids": [1, 4, 9],
+      "added_ids": [8],
+      "removed_ids": [12, 13],
+      "total_score": 150
+    },
+    {
+      "selected_ids": [4, 7, "/* … */"],
+      "retained_ids": [7],
+      "added_ids": [4],
+      "removed_ids": ["/* … */"],
+      "total_score": 150
+    }
+  ],
+  "seed": 42
+}
+```
+
+单卷改卷时差异字段与 `source_task_id` 直接位于结果顶层（不返回 `papers` 数组）：
+
+```json
+{
+  "status": "feasible",
+  "source_task_id": 7,
+  "selected_ids": [1, 2, 5],
+  "retained_ids": [1, 5],
+  "added_ids": [2],
+  "removed_ids": [3]
+}
+```
+
+### 定向改卷无解
+
+编辑条件与原有约束冲突时，`conflict_constraints` 同样返回逐项删减验证的删除极小冲突集，其中人工编辑条件为：
+
+- `kind: "question_retain"`（必须保留）/ `"question_remove"`（必须移除）；
+- `scope: "per_paper"`，`detail.paper` 为卷序号、`detail.question_id` 为题号、`detail.edit` 为“保留”/“移除”，可直接定位到“哪份卷的哪道题”。
+
+```json
+{
+  "status": "infeasible",
+  "source_task_id": 42,
+  "message": "不存在满足全部约束及人工编辑条件的平行卷组",
+  "conflict_constraints": [
+    {"kind": "type", "scope": "per_paper",
+     "detail": {"paper": 0, "type": "essay", "count": 4}},
+    {"kind": "question_retain", "scope": "per_paper",
+     "detail": {"paper": 0, "question_id": 21, "edit": "保留"}},
+    {"kind": "shared_questions", "scope": "cross_paper",
+     "detail": {"papers": [0, 1], "max_shared_questions": 0}}
+  ]
+}
+```
+
 ## 可行结果
 
 ```json
 {
   "status": "feasible",
-  "selected_ids": [1, 2, 4],
+  "selected_ids": [1, 2, 5],
   "total_score": 20,
-  "average_difficulty": 0.48,
-  "difficulty_deviation": 0.02,
+  "average_difficulty": 0.525,
+  "difficulty_deviation": 0.025,
   "type_counts": {"single_choice": 2, "essay": 1},
-  "knowledge_point_counts": {"集合": 1, "函数": 2, "导数": 1},
-  "repeated_knowledge_points": 1,
+  "knowledge_point_counts": {"集合": 1, "函数": 1, "数列": 1},
+  "repeated_knowledge_points": 0,
   "paper": [ /* 完整题目对象 */ ]
 }
 ```
@@ -185,4 +290,4 @@ curl -X POST http://localhost:8000/api/tasks \
 }
 ```
 
-单卷冲突项的 `kind` 取值：`total_score` / `type` / `coverage` / `difficulty_range` / `mutex`；多卷时另有跨卷项 `shared_questions`（`scope: "cross_paper"`），单卷项带 `scope: "per_paper"`。
+单卷冲突项的 `kind` 取值：`total_score` / `type` / `coverage` / `difficulty_range` / `mutex`；多卷时另有跨卷项 `shared_questions`（`scope: "cross_paper"`），单卷项带 `scope: "per_paper"`。定向改卷任务的人工编辑条件为 `question_retain` / `question_remove`（均带 `scope: "per_paper"`，可定位到 `detail.paper` 与 `detail.question_id`）。

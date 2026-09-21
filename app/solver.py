@@ -19,6 +19,11 @@ CP-SAT 模型**中：每份卷各自满足总分、题型、知识点覆盖、�
 逐条尝试移除约束，若移除后仍无解则永久删除，最终保留的即为最小冲突集。
 冲突项通过 scope 区分：per_paper 为单卷约束（detail.paper 为从 0 起的卷序号），
 cross_paper 为跨卷重叠上限（kind=shared_questions）。
+
+定向改卷（revise）：在冻结的源请求之上，按卷追加人工编辑条件
+（question_retain：该卷必须选入；question_remove：该卷不得选入）。
+择优在原三层之前新增第 0 层“各卷保留源卷原题总数最大化”，无解时人工编辑条件
+同样可进入最小冲突集，其 detail 可定位到卷与题号（paper + question_id）。
 """
 from __future__ import annotations
 
@@ -32,6 +37,9 @@ STAGE_TIME_LIMIT = 20.0  # 每个择优阶段的求解上限（秒）
 MUS_TIME_LIMIT = 15.0  # 冲突集逐项验证的单次求解上限（秒）
 
 MAX_PAPER_COUNT = 5  # 平行卷数量上限（下限 2，缺省/1 为单卷）
+
+# 定向改卷的人工编辑条件（可参与冲突集删减验证，定位到卷与题号）
+EDIT_KINDS = ("question_retain", "question_remove")
 
 
 # --------------------------------------------------------------------------- #
@@ -49,7 +57,11 @@ def _id_sort_key(qid: Any):
     return (1, s)
 
 
-def _prepare(req: Dict[str, Any]) -> Dict[str, Any]:
+def _prepare(
+    req: Dict[str, Any],
+    source_selection: Optional[List[List[Any]]] = None,
+    edits: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     questions = sorted(req["questions"], key=lambda q: _id_sort_key(q["id"]))
     ids = [q["id"] for q in questions]
     id_index = {qid: i for i, qid in enumerate(ids)}
@@ -98,6 +110,34 @@ def _prepare(req: Dict[str, Any]) -> Dict[str, Any]:
         "max_shared": max_shared,
     }
     d["specs"] = _build_constraint_specs(d)
+
+    # 定向改卷：冻结源卷选择（题号 -> 题库下标集合）与逐卷人工编辑条件
+    d["revise"] = source_selection is not None
+    if d["revise"]:
+        source_sets: List[set] = []
+        for p in range(paper_count):
+            ids_p = source_selection[p] if p < len(source_selection) else []
+            source_sets.append({id_index[qid] for qid in ids_p if qid in id_index})
+        d["source_sel"] = source_sets
+        if edits:
+            for e in edits:
+                p = int(e["paper"])
+                for qid in e.get("retain_ids", []):
+                    d["specs"].append(
+                        {
+                            "kind": "question_retain",
+                            "paper": p,
+                            "detail": {"question_id": qid},
+                        }
+                    )
+                for qid in e.get("remove_ids", []):
+                    d["specs"].append(
+                        {
+                            "kind": "question_remove",
+                            "paper": p,
+                            "detail": {"question_id": qid},
+                        }
+                    )
     return d
 
 
@@ -210,6 +250,12 @@ def _build_model(
     shared_total = (
         sum(share_sums.values()) if share_sums else 0
     )
+    # 定向改卷第 0 择优目标：各卷保留源卷原题的总数（Σ_p Σ_{i∈源卷p} x[p][i]）
+    retained_total = 0
+    if d.get("revise"):
+        retained_total = sum(
+            sum(x[p][i] for i in d["source_sel"][p]) for p in range(P)
+        )
     extra = {
         "score_sum": score_sums,
         "sd": sds,
@@ -217,6 +263,7 @@ def _build_model(
         "total_dev": total_dev,
         "shared_total": shared_total,
         "share_sums": share_sums,
+        "retained_total": retained_total,
     }
 
     specs = d["specs"]
@@ -262,6 +309,14 @@ def _build_model(
         elif kind == "mutex":
             group = spec["detail"]["group"]
             m.Add(sum(xp[d["id_index"][qid]] for qid in group) <= 1)
+
+        elif kind == "question_retain":
+            # 人工编辑：该卷必须选入此题
+            m.Add(xp[d["id_index"][spec["detail"]["question_id"]]] == 1)
+
+        elif kind == "question_remove":
+            # 人工编辑：该卷不得选入此题
+            m.Add(xp[d["id_index"][spec["detail"]["question_id"]]] == 0)
 
     return m, x, extra
 
@@ -347,9 +402,27 @@ def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optio
     n = len(d["questions"])
     P = d["P"]
     active = set(range(len(d["specs"])))
+    revise = d.get("revise", False)
+
+    # 定向改卷阶段 0：最大化各卷保留源卷原题的总数（先满足全部约束，再谈保留）
+    best_retained: Optional[int] = None
+    if revise:
+        m, x, extra = _build_model(d, active)
+        m.Maximize(extra["retained_total"])
+        s = _solver(d)
+        s.parameters.max_time_in_seconds = STAGE_TIME_LIMIT
+        status = s.Solve(m)
+        if status == cp_model.INFEASIBLE:
+            return "infeasible", None, None
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return "unknown", None, "求解器在规定时间内无法判定可行性"
+        best_retained = int(s.Value(extra["retained_total"]))
+        chosen = [[bool(s.Value(x[p][i])) for i in range(n)] for p in range(P)]
 
     # 阶段 1：各卷难度偏差（单卷即其自身偏差）最小
     m, x, extra = _build_model(d, active)
+    if revise:
+        m.Add(extra["retained_total"] == best_retained)
     m.Minimize(extra["total_dev"])
     s = _solver(d)
     s.parameters.max_time_in_seconds = STAGE_TIME_LIMIT
@@ -363,6 +436,8 @@ def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optio
 
     # 阶段 2：单卷最小化重复知识点数；多卷最小化跨卷重复题总数
     m, x, extra = _build_model(d, active)
+    if revise:
+        m.Add(extra["retained_total"] == best_retained)
     m.Add(extra["total_dev"] == best_dev)
     if P == 1:
         objective_2 = _repeat_expr(m, d, x[0], "p0")
@@ -389,6 +464,8 @@ def _optimize(d: Dict[str, Any]) -> Tuple[str, Optional[List[List[bool]]], Optio
     for step in range(total_steps):
         p, k = divmod(step, n_chunks_paper)
         m, x, extra = _build_model(d, active)
+        if revise:
+            m.Add(extra["retained_total"] == best_retained)
         m.Add(extra["total_dev"] == best_dev)
         if P == 1:
             m.Add(_repeat_expr(m, d, x[0], "p0") == best_second)
@@ -464,7 +541,27 @@ def _minimal_conflicts(d: Dict[str, Any]) -> Tuple[Optional[List[Dict[str, Any]]
 # 入口
 # --------------------------------------------------------------------------- #
 def solve_exam(req: Dict[str, Any]) -> Dict[str, Any]:
-    d = _prepare(req)
+    return _solve_prepared(_prepare(req))
+
+
+def solve_revise(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """定向改卷：payload 为创建改卷任务时冻结的完整数据（源请求 + 编辑条件）。
+
+    payload["source_request"] 为源组卷请求，payload["source_selection"] 为源任务
+    各卷选中的题号（逐卷冻结），payload["edits"] 为逐卷人工编辑条件。
+    """
+    base_req = payload["source_request"]
+    d = _prepare(
+        base_req,
+        source_selection=payload.get("source_selection"),
+        edits=payload.get("edits"),
+    )
+    result = _solve_prepared(d)
+    _attach_revision(d, payload, result)
+    return result
+
+
+def _solve_prepared(d: Dict[str, Any]) -> Dict[str, Any]:
     active = set(range(len(d["specs"])))
 
     # 快速无解预判
@@ -482,6 +579,45 @@ def solve_exam(req: Dict[str, Any]) -> Dict[str, Any]:
     # 无解：逐项删减验证最小冲突集
     conflicts, note = _minimal_conflicts(d)
     return _infeasible_result(d, conflicts, note)
+
+
+def _attach_revision(
+    d: Dict[str, Any], payload: Dict[str, Any], result: Dict[str, Any]
+) -> None:
+    """为改卷结果补充 source_task_id 及逐卷 retained/added/removed_ids（原地写入）。"""
+    result["source_task_id"] = payload["source_task_id"]
+    if result.get("status") != "feasible":
+        return
+
+    def diff(selected_ids: List[Any], p: int) -> Tuple[List[Any], List[Any], List[Any]]:
+        # 以源任务冻结的源卷题号集合为准，按新卷题库规范化顺序输出
+        source_ids = set(
+            payload["source_selection"][p]
+            if p < len(payload["source_selection"])
+            else []
+        )
+        selected = set(selected_ids)
+        retained = [qid for qid in selected_ids if qid in source_ids]
+        added = [qid for qid in selected_ids if qid not in source_ids]
+        removed = [
+            qid
+            for qid in d["ids"]
+            if qid in source_ids and qid not in selected
+        ]
+        return retained, added, removed
+
+    if not d["is_multi"]:
+        retained, added, removed = diff(result["selected_ids"], 0)
+        result["retained_ids"] = retained
+        result["added_ids"] = added
+        result["removed_ids"] = removed
+        return
+
+    for p, paper in enumerate(result["papers"]):
+        retained, added, removed = diff(paper["selected_ids"], p)
+        paper["retained_ids"] = retained
+        paper["added_ids"] = added
+        paper["removed_ids"] = removed
 
 
 def _infeasible_result(
@@ -503,6 +639,18 @@ def _infeasible_result(
                 "scope": "cross_paper",
                 "detail": c["detail"],
             }
+        if c["kind"] in EDIT_KINDS:
+            # 人工编辑条件：始终定位到卷与题号（单卷改卷同样带 paper 以便定位）
+            label = "保留" if c["kind"] == "question_retain" else "移除"
+            return {
+                "kind": c["kind"],
+                "scope": "per_paper",
+                "detail": {
+                    "paper": c["paper"],
+                    "question_id": c["detail"]["question_id"],
+                    "edit": label,
+                },
+            }
         if d["is_multi"]:
             # 单卷约束标注卷序号（从 0 起），与跨卷重叠上限区分
             return {
@@ -516,6 +664,12 @@ def _infeasible_result(
     default_msg = (
         "不存在满足全部约束的平行卷组" if d["is_multi"] else "不存在满足全部约束的试卷"
     )
+    if d.get("revise"):
+        default_msg = (
+            "不存在满足全部约束及人工编辑条件的平行卷组"
+            if d["is_multi"]
+            else "不存在满足全部约束及人工编辑条件的试卷"
+        )
     result: Dict[str, Any] = {
         "status": "infeasible",
         "message": reason or default_msg,
